@@ -1,4 +1,3 @@
-# This is the beginning of fly-4less-ai
 import os
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -8,7 +7,6 @@ import re
 from datetime import datetime
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from threading import Thread
 
 load_dotenv()
 
@@ -20,6 +18,79 @@ if not GEMINI_API_KEY:
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-2.0-flash')
 
+
+def _get_flights_in_thread(flight_data, trip_type, seat, passengers):
+    """
+    Helper function to run get_flights in a separate thread with its own event loop.
+    """
+    try:
+        results = get_flights(
+            flight_data=flight_data,
+            trip=trip_type,
+            seat=seat,
+            passengers=passengers,
+            fetch_mode="local"
+        )
+        return results
+    except Exception as e:
+        print(f"Error in thread: {e}")
+        raise
+
+
+def _deep_search_flights(flight_data, trip_type, seat, passengers, num_scrolls=3):
+    """
+    Performs a deep search by making multiple requests and aggregating results.
+    This mimics SerpAPI's deep_search feature.
+    
+    Args:
+        num_scrolls: Number of times to "scroll" through results (default 3)
+    """
+    all_flights = []
+    seen_flights = set()  # Track flights we've already seen
+    
+    try:
+        for scroll in range(num_scrolls):
+            print(f"Deep search iteration {scroll + 1}/{num_scrolls}...")
+            
+            # Make request
+            results = get_flights(
+                flight_data=flight_data,
+                trip=trip_type,
+                seat=seat,
+                passengers=passengers,
+                fetch_mode="local"
+            )
+            
+            # Collect unique flights
+            if results and hasattr(results, 'flights'):
+                for flight in results.flights:
+                    # Create unique identifier for flight
+                    flight_id = f"{flight.name}_{flight.departure}_{flight.arrival}_{flight.price}"
+                    
+                    if flight_id not in seen_flights:
+                        seen_flights.add(flight_id)
+                        all_flights.append(flight)
+                
+                print(f"Found {len(all_flights)} unique flights so far...")
+            
+            # Small delay between scrolls to let Google Flights update
+            if scroll < num_scrolls - 1:
+                import time
+                time.sleep(15)
+        
+        # Return modified result object with all flights
+        if results:
+            # Replace flights list with our aggregated list
+            results.flights = all_flights
+        
+        return results
+    
+    except Exception as e:
+        print(f"Error in deep search: {e}")
+        raise
+
+
+# Keep all your existing functions from before
 def extract_flight_details(user_input):
     """
     Uses Gemini API to extract structured flight query details from natural language input.
@@ -40,12 +111,11 @@ Example: {{"departure": "YYZ", "destination": "JFK", "depart_date": "2025-03-10"
         text = response.text.strip()
         
         print(f"DEBUG - Raw response: '{text}'")
-
-                # Remove markdown code blocks if present
-        text = text.replace("`", "").strip()
+        
+        # Remove markdown code blocks if present
+        text = text.replace(chr(96), "").strip()
         if text.startswith("json"):
             text = text[4:].strip()
-
         
         print(f"DEBUG - After cleanup: '{text}'")
         
@@ -120,29 +190,13 @@ def normalize_airport_code(code):
     return None
 
 
-def _get_flights_in_thread(flight_data, trip_type, seat, passengers):
-    """
-    Helper function to run get_flights in a separate thread with its own event loop.
-    This avoids the "asyncio.run() cannot be called from a running event loop" error.
-    """
-    try:
-        results = get_flights(
-            flight_data=flight_data,
-            trip=trip_type,
-            seat=seat,
-            passengers=passengers,
-            fetch_mode="local"
-        )
-        print(results)
-        return results
-    except Exception as e:
-        print(f"Error in thread: {e}")
-        raise
-
-
-async def search_flights_fastflights(departure, destination, depart_date, return_date=None, adults=1, children=0):
+async def search_flights_fastflights(departure, destination, depart_date, return_date=None, adults=1, children=0, deep_search=True):
     """
     Searches for flights using the fast_flights library with LOCAL mode.
+    Supports deep search for more comprehensive results.
+    
+    Args:
+        deep_search: If True, performs multiple searches to get all available flights
     """
     # Normalize airport codes
     departure = normalize_airport_code(departure)
@@ -166,22 +220,32 @@ async def search_flights_fastflights(departure, destination, depart_date, return
     )
     
     try:
-        print("Searching for flights (this may take 10-15 seconds for complete results)...")
-        
-        # Run in thread pool executor
         loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
-            None,
-            _get_flights_in_thread,
-            flight_data,
-            trip_type,
-            "economy",
-            passengers
-        )
+        
+        if deep_search:
+            print("🔎 Performing DEEP SEARCH (this takes longer but finds more flights)...")
+            results = await loop.run_in_executor(
+                None,
+                _deep_search_flights,
+                flight_data,
+                trip_type,
+                "economy",
+                passengers,
+                5  # num_scrolls
+            )
+        else:
+            print("🔍 Performing standard search...")
+            results = await loop.run_in_executor(
+                None,
+                _get_flights_in_thread,
+                flight_data,
+                trip_type,
+                "economy",
+                passengers
+            )
         
         return results
     
     except Exception as e:
         print(f"Error fetching flights: {e}")
         raise
-
